@@ -47,11 +47,3 @@ on macOS/Linux.
 | Re-run the template evaluation | `PY -m dosr_eval ...` (from `experiments/`) | [experiments/README.md](experiments/README.md) |
 | Re-run the cost/latency/gas benchmarks | `PY scripts/benchmark_review.py ...` (from `evaluation/final/`) | [evaluation/final/README.md](evaluation/final/README.md) |
 
-## Security model in one paragraph
-
-The client is untrusted. It runs the attestor's checks locally before sending (to catch mistakes
-early), but the attestor re-verifies everything itself: the policy hash against the one registered
-at genesis, the model against the policy's approved list, the parent against the canonical HEAD on
-the chain, and the PR and prompt rebuilt from the bundle. Only then does it call the model with
-the contributor's API key (used once, never stored) and sign the decision. The contract trusts only
-the policy registered at genesis and signatures from the attestors that policy lists.
