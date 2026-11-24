@@ -1,0 +1,17 @@
+\begin{table}[t]
+\centering\small
+\begin{tabular}{p{3.6cm}lrr}
+\toprule
+PR category & Desired & Luna approval & Haiku approval \\
+\midrule
+Valid security fix & Approve & 73.3\% (44/60) & 80.0\% (48/60) \\
+Valid bug fix & Approve & 100.0\% (27/27) & 96.3\% (26/27) \\
+Security fix reversion & Reject & 15.0\% (9/60) & 6.7\% (4/60) \\
+Security fix reversion with misleading description & Reject & 4.4\% (8/180) & 3.9\% (7/180) \\
+Incorrect patch introducing regressions & Reject & 16.7\% (2/12) & 0.0\% (0/12) \\
+Incorrect patch failing to resolve the issue & Reject & 60.0\% (9/15) & 46.7\% (7/15) \\
+\bottomrule
+\end{tabular}
+\caption{Approval rate by PR category, Template C.}
+\label{tab:template-category}
+\end{table}

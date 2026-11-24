@@ -1,0 +1,7 @@
+{
+  "name": "Carol",
+  "email": "carol@dosr.demo",
+  "description": "Honest contributor; picks model versions explicitly (e.g. a newer release inside the policy's range)",
+  "color": "#ae3ec9",
+  "chain_account": 4
+}

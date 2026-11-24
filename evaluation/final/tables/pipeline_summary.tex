@@ -1,0 +1,17 @@
+\begin{table}[t]
+\centering\small
+\begin{tabular}{llrrrr}
+\toprule
+Model & PR size & Latency excl.\ EVM (s) & Inference (\textcent) & Est.\ tx (\textcent) & Total (\textcent) \\
+\midrule
+GPT-6-Luna & Small & 6.4 & 0.05 & 60.98 & 61.02 \\
+GPT-6-Luna & Medium & 15.2 & 0.26 & 60.98 & 61.24 \\
+GPT-6-Luna & Large & 30.3 & 0.52 & 60.98 & 61.49 \\
+Claude Haiku 5.5 & Small & 6.9 & 0.09 & 61.00 & 61.08 \\
+Claude Haiku 5.5 & Medium & 12.4 & 0.43 & 61.00 & 61.42 \\
+Claude Haiku 5.5 & Large & 16.6 & 0.91 & 61.00 & 61.91 \\
+\bottomrule
+\end{tabular}
+\caption{Approved submissions through the full DOSR pipeline: median wall-clock latency excluding the EVM transactions (local IPFS node); mean inference cost at list price and estimated transaction cost at 1 gwei.}
+\label{tab:pipeline}
+\end{table}

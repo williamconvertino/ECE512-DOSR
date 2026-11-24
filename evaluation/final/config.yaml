@@ -1,0 +1,81 @@
+seed: 20261123
+
+models:
+  primary:
+    - openai/gpt-6-luna@latest
+    - anthropic/claude-haiku-5-5@latest
+  extended:
+    - openai/gpt-6.2-sol@latest
+    - anthropic/claude-sonnet-5-5@latest
+
+template_file: experiments/templates/exp-blocking-only-v1.toml
+providers_file: experiments/providers.json
+
+reps:
+  primary: 3
+  extended: 1
+
+pricing:
+  openai/gpt-6-luna@latest:
+    input: 0.10
+    cached_input: 0.01
+    output: 0.50
+    long_context: {above_prompt_tokens: 272000, input: 0.20, cached_input: 0.02, output: 0.75}
+  openai/gpt-6.2-sol@latest:
+    input: 2.00
+    cached_input: 0.10
+    output: 10.00
+    long_context: {above_prompt_tokens: 272000, input: 4.00, cached_input: 0.20, output: 15.00}
+  anthropic/claude-haiku-5-5@latest:
+    input: 0.10
+    output: 0.50
+    long_context: {above_prompt_tokens: 100000, input: 0.50, output: 2.50}
+  anthropic/claude-sonnet-5-5@latest:
+    input: 2.00
+    output: 10.00
+
+buckets:
+  - [1, 10]
+  - [11, 50]
+  - [51, 100]
+  - [101, 250]
+  - [251, 500]
+  - [501, 1000]
+  - [1001, 2000]
+per_bucket: 5
+max_per_repo_per_bucket: 2
+
+repos:
+  requests: https://github.com/psf/requests.git
+  pytest: https://github.com/pytest-dev/pytest.git
+  pylint: https://github.com/pylint-dev/pylint.git
+  seaborn: https://github.com/mwaskom/seaborn.git
+  xarray: https://github.com/pydata/xarray.git
+  cJSON: https://github.com/DaveGamble/cJSON.git
+
+filters:
+  source_extensions: [.py, .pyi, .c, .h]
+  min_source_line_share: 0.8
+  max_changed_files: 30
+  max_file_bytes: 400000
+  max_prompt_est_tokens: 120000
+  exclude_message_regex: "(?i)(reformat|black|isort|ruff|pre-commit|autoupdate|typo|bump|release|changelog|vendor|revert|merge|lint fixes|format code|codespell|pyupgrade|upgrade syntax|copyright|license|formatting|typing-update|backup|urllib3|vendored|alias for|whitespace|^v?\\d+\\.\\d+)"
+  exclude_path_regex: "(?i)(\\.lock$|lock\\.json$|\\.min\\.|/vendor/|/_vendor/|/extern/|\\.svg$|\\.csv$|\\.ipynb$|/data/|\\.dosr/|^/requests/packages/)"
+
+policy:
+  preset: standard
+  max_changed_files: 100
+  max_patch_bytes: 1000000
+
+pipeline_subset:
+  small: {target: 10, pick: 3}
+  medium: {target: 100, pick: 3}
+  large: {range: [500, 1000], pick: 3}
+
+gas:
+  gwei_scenarios: [0.1, 1, 10]
+  primary_gwei: 1
+  eth_usd: 1703.38
+  eth_usd_source: "Coinbase spot price API (api.coinbase.com/v2/prices/ETH-USD/spot), 2026-11-24 02:08 UTC; CoinGecko simple/price returned 1701.77 at the same time"
+
+budget_usd: 18.0

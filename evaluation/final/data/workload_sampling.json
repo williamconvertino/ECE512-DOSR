@@ -1,0 +1,116 @@
+{
+  "seed": 20261123,
+  "filter_stats": {
+    "requests": {
+      "message": 279,
+      "not mostly source": 793,
+      "eligible": 421,
+      "binary": 17,
+      "rename": 4,
+      "excluded path": 29,
+      "too many files": 6
+    },
+    "pytest": {
+      "not mostly source": 1276,
+      "message": 895,
+      "eligible": 2255,
+      "too many files": 35,
+      "rename": 60,
+      "binary": 12,
+      "excluded path": 1
+    },
+    "pylint": {
+      "eligible": 3682,
+      "excluded path": 533,
+      "not mostly source": 2385,
+      "message": 1450,
+      "too many files": 80,
+      "rename": 170,
+      "binary": 5
+    },
+    "seaborn": {
+      "not mostly source": 167,
+      "eligible": 537,
+      "too many files": 6,
+      "excluded path": 144,
+      "message": 188,
+      "rename": 7,
+      "binary": 9
+    },
+    "xarray": {
+      "eligible": 2498,
+      "not mostly source": 1360,
+      "message": 723,
+      "excluded path": 33,
+      "rename": 38,
+      "too many files": 30,
+      "binary": 19
+    },
+    "cJSON": {
+      "message": 60,
+      "eligible": 119,
+      "not mostly source": 85,
+      "rename": 1
+    }
+  },
+  "pool_sizes": {
+    "1-10": {
+      "requests": 244,
+      "pytest": 712,
+      "pylint": 1122,
+      "seaborn": 209,
+      "xarray": 499,
+      "cJSON": 73
+    },
+    "11-50": {
+      "requests": 129,
+      "pytest": 902,
+      "pylint": 1475,
+      "seaborn": 201,
+      "xarray": 882,
+      "cJSON": 37
+    },
+    "51-100": {
+      "requests": 27,
+      "pytest": 301,
+      "pylint": 560,
+      "seaborn": 62,
+      "xarray": 397,
+      "cJSON": 6
+    },
+    "101-250": {
+      "requests": 12,
+      "pytest": 220,
+      "pylint": 367,
+      "seaborn": 40,
+      "xarray": 391,
+      "cJSON": 3
+    },
+    "251-500": {
+      "requests": 4,
+      "pytest": 77,
+      "pylint": 101,
+      "seaborn": 11,
+      "xarray": 190
+    },
+    "501-1000": {
+      "requests": 3,
+      "pytest": 27,
+      "pylint": 33,
+      "seaborn": 8,
+      "xarray": 91
+    },
+    "1001-2000": {
+      "requests": 2,
+      "pytest": 14,
+      "pylint": 17,
+      "seaborn": 5,
+      "xarray": 32
+    }
+  },
+  "skipped_at_pick": {
+    "large file": 3,
+    "prompt too large": 1
+  },
+  "chosen": 35
+}

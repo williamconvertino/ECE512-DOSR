@@ -1,0 +1,18 @@
+\begin{table}[t]
+\centering\small
+\begin{tabular}{llrrr}
+\toprule
+Operation & Occurrence & Gas & ETH & USD \\
+\midrule
+Registry deployment & first (contract creation) & 1,758,026 & 0.001758 & \$2.9946 \\
+Repository initialization & first repository in registry & 319,982 & 0.000320 & \$0.5451 \\
+Accept approved PR & first PR of repository & 238,202 & 0.000238 & \$0.4057 \\
+Publish IPFS snapshot locator & first snapshot of repository & 119,891 & 0.000120 & \$0.2042 \\
+Accept approved PR & subsequent PR & 221,062--221,102 & 0.000221 & \$0.3766 \\
+Publish IPFS snapshot locator & subsequent snapshot (overwrite) & 48,693 & 0.000049 & \$0.0829 \\
+Repository initialization & subsequent repository & 302,834--302,870 & 0.000303 & \$0.5159 \\
+\bottomrule
+\end{tabular}
+\caption{Gas measured on a local EVM (anvil); estimated cost at 1 gwei and \$1,703.38/ETH. Estimates, not fees paid.}
+\label{tab:gas}
+\end{table}

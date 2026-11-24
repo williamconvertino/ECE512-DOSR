@@ -1,0 +1,1151 @@
+import argparse
+import hashlib
+import io
+import os
+import platform
+import shutil
+import subprocess
+import sys
+import tarfile
+import time
+import zipfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+DEMO = ROOT / "demo"
+WORKSPACE = DEMO / "workspace"
+CHAIN_STATE = WORKSPACE / ".chain" / "state.json"
+PROJECTS = DEMO / "projects"
+CLIENTS = DEMO / "clients"
+TEMPLATES = DEMO / "templates"
+ATTESTOR_DIR = ROOT / "services" / "attestor"
+
+IPFS_DIR = DEMO / ".ipfs"
+LOCAL_STORE = IPFS_DIR / "local-store"
+KUBO_VERSION = "v0.43.1"
+IPFS_API = "http://127.0.0.1:5001"
+
+FOUNDRY_DIR = DEMO / ".foundry"
+FOUNDRY_VERSION = "v1.9.0"
+CHAIN_DIR = DEMO / ".chain"
+ANVIL_STATE = CHAIN_DIR / "anvil-state.json"
+CHAIN_RPC = os.environ.get("DOSR_RPC_URL", "http://127.0.0.1:8545")
+CHAIN_KIND = "evm"
+
+
+class Device:
+
+    def __init__(self, name: str = "a"):
+        if len(name) != 1 or not name.isalpha():
+            raise SystemExit("--device must be a single letter (a, b, ...)")
+        self.name = name.lower()
+        i = ord(self.name) - ord("a")
+        self.workspace = DEMO / ("workspace" if i == 0 else f"workspace-{self.name}")
+        self.chain_state = self.workspace / ".chain" / "state.json"
+        self.attestor_port = 8080 + i
+        self.gui_port = 8765 + i
+        self.inbox_port = 8790 + i
+        self.ipfs_repo = IPFS_DIR / ("repo" if i == 0 else f"repo-{self.name}")
+        self.ipfs_api_port = 5001 + i
+        self.ipfs_api = f"http://127.0.0.1:{self.ipfs_api_port}"
+        self.ipfs_swarm_port = 4001 + i
+        self.ipfs_gateway_port = 8089 + i
+
+    @property
+    def label(self) -> str:
+        return f"device-{self.name}"
+
+
+DEVICE = Device("a")
+
+
+def _require_deps():
+    try:
+        import dosr_client
+        import uvicorn
+    except ImportError:
+        print("DOSR packages are not installed in this Python.\n"
+              "Run `python demo/setup_env.py`, then use demo/.venv's Python "
+              "(Windows: demo\\.venv\\Scripts\\python.exe, macOS/Linux: demo/.venv/bin/python).",
+              file=sys.stderr)
+        sys.exit(1)
+
+
+def load_dotenv() -> None:
+    path = ROOT / ".env"
+    if not path.exists():
+        return
+    for line in path.read_text("utf-8").splitlines():
+        key, sep, value = line.strip().partition("=")
+        if sep and key and not key.startswith("#") and value.strip():
+            os.environ.setdefault(key.strip(), value.strip().strip("'\""))
+
+
+def attestor_url(port: int) -> str:
+    return f"http://127.0.0.1:{port}"
+
+
+def attestor_up(port: int) -> bool:
+    import httpx
+
+    try:
+        return httpx.get(attestor_url(port) + "/v1/health", timeout=1.0).status_code == 200
+    except httpx.HTTPError:
+        return False
+
+
+def attestor_env(device: Device | None = None) -> dict:
+    device = device or DEVICE
+    env = {k: v for k, v in os.environ.items() if k not in ("DOSR_CHAIN_STATE", "DOSR_CHAIN", "DOSR_RPC_URL")}
+    env.update(chain_env() if CHAIN_KIND == "evm" else {"DOSR_CHAIN_STATE": str(device.chain_state)})
+    env["ATTESTOR_CACHE_DIR"] = str(device.workspace / ".attestor-cache")
+    return env
+
+
+def chain_argv(device: Device | None = None) -> list[str]:
+    if CHAIN_KIND == "evm":
+        e = chain_env()
+        return ["--chain", "evm", "--rpc-url", e["DOSR_RPC_URL"], "--contract", e["DOSR_CONTRACT"]]
+    return ["--chain-state", str((device or DEVICE).chain_state)]
+
+
+def ensure_chain(procs: list | None = None) -> None:
+    global CHAIN_KIND
+    if CHAIN_KIND != "evm":
+        print("Chain: per-device mock chain files (--chain mock).")
+        return
+    try:
+        proc = start_chain_process()
+    except (SystemExit, Exception) as e:
+        CHAIN_KIND = "mock"
+        print(f"WARNING: the EVM dev chain is unavailable ({e}).\n         Falling back to per-device mock chain "
+              "files; run `demo.py chain install` to get anvil.")
+        return
+    if proc and procs is not None:
+        procs.append(proc)
+
+
+def attestor_chain_problem(port: int) -> str | None:
+    import httpx
+
+    try:
+        info = httpx.get(attestor_url(port) + "/v1/chain", timeout=3).json()
+    except (httpx.HTTPError, ValueError):
+        return "it does not report its chain (an older attestor?)"
+    if info.get("kind") != CHAIN_KIND:
+        return f"it reads the {info.get('kind')} chain, this demo uses {CHAIN_KIND}"
+    if CHAIN_KIND == "evm" and (info.get("contract") or "").lower() != chain_env()["DOSR_CONTRACT"].lower():
+        return f"it reads contract {info.get('contract')}"
+    return None
+
+
+def start_attestor_process(port: int, device: Device | None = None) -> subprocess.Popen:
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "uvicorn", "attestor.main:app", "--port", str(port), "--log-level", "warning"],
+        cwd=ATTESTOR_DIR, env=attestor_env(device),
+    )
+    for _ in range(60):
+        if attestor_up(port):
+            return proc
+        if proc.poll() is not None:
+            raise SystemExit(f"attestor exited with code {proc.returncode} (is port {port} in use?)")
+        time.sleep(0.25)
+    proc.terminate()
+    raise SystemExit("attestor did not become healthy within 15s")
+
+
+def ipfs_binary() -> Path | None:
+    local = IPFS_DIR / "bin" / ("ipfs.exe" if sys.platform == "win32" else "ipfs")
+    if local.exists():
+        return local
+    found = shutil.which("ipfs")
+    return Path(found) if found else None
+
+
+def ipfs_up(api: str | None = None) -> bool:
+    import httpx
+
+    try:
+        return httpx.post((api or DEVICE.ipfs_api) + "/api/v0/id",
+                          timeout=httpx.Timeout(2, connect=0.5)).status_code == 200
+    except httpx.HTTPError:
+        return False
+
+
+def _kubo_asset() -> str:
+    machine = platform.machine().lower()
+    arch = "arm64" if machine in ("arm64", "aarch64") else "amd64"
+    if sys.platform == "win32":
+        return f"kubo_{KUBO_VERSION}_windows-{arch}.zip"
+    osname = "darwin" if sys.platform == "darwin" else "linux"
+    return f"kubo_{KUBO_VERSION}_{osname}-{arch}.tar.gz"
+
+
+def ipfs_install(force: bool = False) -> Path:
+    import httpx
+
+    existing = ipfs_binary()
+    if existing and not force:
+        print(f"IPFS already available: {existing}")
+        return existing
+    asset = _kubo_asset()
+    base = f"https://github.com/ipfs/kubo/releases/download/{KUBO_VERSION}/{asset}"
+    print(f"Downloading {base} ...")
+    data = httpx.get(base, follow_redirects=True, timeout=300).raise_for_status().content
+    expected = httpx.get(base + ".sha512", follow_redirects=True, timeout=60).raise_for_status().text.split()[0]
+    if hashlib.sha512(data).hexdigest() != expected.lower():
+        raise SystemExit("downloaded Kubo archive does not match its published sha512; not installing")
+    name = "ipfs.exe" if sys.platform == "win32" else "ipfs"
+    if asset.endswith(".zip"):
+        member = zipfile.ZipFile(io.BytesIO(data)).read(f"kubo/{name}")
+    else:
+        member = tarfile.open(fileobj=io.BytesIO(data), mode="r:gz").extractfile(f"kubo/{name}").read()
+    out = IPFS_DIR / "bin" / name
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_bytes(member)
+    out.chmod(0o755)
+    print(f"Installed IPFS (Kubo {KUBO_VERSION}) at {out}")
+    return out
+
+
+def _ipfs_env(device: Device) -> dict:
+    return {**os.environ, "IPFS_PATH": str(device.ipfs_repo)}
+
+
+def ipfs_prepare(binary: Path, device: Device) -> None:
+    env = _ipfs_env(device)
+    if not (device.ipfs_repo / "config").exists():
+        print(f"Initializing IPFS node in {device.ipfs_repo} ...")
+        device.ipfs_repo.mkdir(parents=True, exist_ok=True)
+        subprocess.run([str(binary), "init", "--empty-repo"], env=env, check=True, stdout=subprocess.DEVNULL)
+    sp = device.ipfs_swarm_port
+    settings = [
+        ("Addresses.API", f"/ip4/127.0.0.1/tcp/{device.ipfs_api_port}"),
+        ("Addresses.Gateway", f"/ip4/127.0.0.1/tcp/{device.ipfs_gateway_port}"),
+        ("--json", "Addresses.Swarm", f'["/ip4/0.0.0.0/tcp/{sp}", "/ip6/::/tcp/{sp}", '
+                                      f'"/ip4/0.0.0.0/udp/{sp}/quic-v1", "/ip6/::/udp/{sp}/quic-v1"]'),
+        ("--json", "Discovery.MDNS.Enabled", "true"),
+    ]
+    for setting in settings:
+        subprocess.run([str(binary), "config", *setting], env=env, check=True)
+
+
+def start_ipfs_process(device: Device | None = None, install: bool = True) -> subprocess.Popen | None:
+    device = device or DEVICE
+    if ipfs_up(device.ipfs_api):
+        print(f"Using already-running IPFS node at {device.ipfs_api}")
+        return None
+    binary = ipfs_binary()
+    if not binary and install:
+        print("IPFS is not installed yet; downloading it once (about 40 MB)...")
+        try:
+            binary = ipfs_install()
+        except (Exception, SystemExit) as e:
+            print(f"  could not install IPFS ({e}).")
+    if not binary:
+        print("IPFS is not available: sharing uses the local store (this computer only). "
+              "Run `demo.py ipfs install` to share with other devices.")
+        return None
+    ipfs_prepare(binary, device)
+    print(f"Starting IPFS node for device {device.name} (API {device.ipfs_api}, swarm port "
+          f"{device.ipfs_swarm_port})...")
+    log_path = IPFS_DIR / f"daemon-{device.name}.log"
+    log = open(log_path, "ab")
+    proc = subprocess.Popen([str(binary), "daemon"], env=_ipfs_env(device), stdout=log, stderr=subprocess.STDOUT)
+    for _ in range(120):
+        if ipfs_up(device.ipfs_api):
+            print(f"IPFS node up at {device.ipfs_api} (log: {log_path})")
+            return proc
+        if proc.poll() is not None:
+            print(f"IPFS node exited (code {proc.returncode}); see {log_path}. Continuing with the local store.")
+            return None
+        time.sleep(0.25)
+    print("IPFS node did not answer within 30 s; continuing (it may come up later).")
+    return proc
+
+
+def cmd_ipfs(args):
+    if args.action == "install":
+        ipfs_install(force=args.force)
+        return 0
+    if args.action == "status":
+        print(f"binary : {ipfs_binary() or 'not installed (demo.py ipfs install)'}")
+        print(f"repo   : {DEVICE.ipfs_repo}")
+        print(f"API    : {DEVICE.ipfs_api} ({'up' if ipfs_up() else 'not running'})")
+        return 0
+    if ipfs_up():
+        print(f"An IPFS node is already running at {DEVICE.ipfs_api}.")
+        return 0
+    binary = ipfs_binary() or ipfs_install()
+    ipfs_prepare(binary, DEVICE)
+    print(f"Starting IPFS (API {DEVICE.ipfs_api}); Ctrl+C to stop.")
+    return subprocess.call([str(binary), "daemon"], env=_ipfs_env(DEVICE))
+
+
+def anvil_binary() -> Path | None:
+    local = FOUNDRY_DIR / "bin" / ("anvil.exe" if sys.platform == "win32" else "anvil")
+    if local.exists():
+        return local
+    found = shutil.which("anvil")
+    return Path(found) if found else None
+
+
+def chain_up(url: str | None = None) -> bool:
+    import httpx
+
+    try:
+        r = httpx.post(url or CHAIN_RPC, json={"jsonrpc": "2.0", "id": 1, "method": "eth_chainId", "params": []},
+                       timeout=httpx.Timeout(2, connect=0.5))
+        return r.status_code == 200 and "result" in r.json()
+    except (httpx.HTTPError, ValueError):
+        return False
+
+
+def _foundry_asset() -> str:
+    machine = platform.machine().lower()
+    arch = "arm64" if machine in ("arm64", "aarch64") else "amd64"
+    if sys.platform == "win32":
+        return f"foundry_{FOUNDRY_VERSION}_win32_{arch}.zip"
+    osname = "darwin" if sys.platform == "darwin" else "linux"
+    return f"foundry_{FOUNDRY_VERSION}_{osname}_{arch}.tar.gz"
+
+
+def anvil_install(force: bool = False) -> Path:
+    import httpx
+
+    existing = anvil_binary()
+    if existing and not force:
+        print(f"anvil already available: {existing}")
+        return existing
+    asset = _foundry_asset()
+    base = f"https://github.com/foundry-rs/foundry/releases/download/{FOUNDRY_VERSION}/{asset}"
+    print(f"Downloading {base} ...")
+    data = httpx.get(base, follow_redirects=True, timeout=300).raise_for_status().content
+    sums = base.rsplit(".", 2 if asset.endswith(".tar.gz") else 1)[0] + ".sha256"
+    expected = httpx.get(sums, follow_redirects=True, timeout=60).raise_for_status().text.split()[0]
+    if hashlib.sha256(data).hexdigest() != expected.lower():
+        raise SystemExit("downloaded Foundry archive does not match its published sha256; not installing")
+    name = "anvil.exe" if sys.platform == "win32" else "anvil"
+    if asset.endswith(".zip"):
+        member = zipfile.ZipFile(io.BytesIO(data)).read(name)
+    else:
+        member = tarfile.open(fileobj=io.BytesIO(data), mode="r:gz").extractfile(name).read()
+    out = FOUNDRY_DIR / "bin" / name
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_bytes(member)
+    out.chmod(0o755)
+    print(f"Installed anvil (Foundry {FOUNDRY_VERSION}) at {out}")
+    return out
+
+
+def start_chain_process(install: bool = True, host: str = "127.0.0.1") -> subprocess.Popen | None:
+    proc = None
+    if chain_up():
+        print(f"Using the dev chain already running at {CHAIN_RPC}")
+    else:
+        binary = anvil_binary()
+        if not binary and install:
+            print("anvil (local Ethereum dev chain) is not installed yet; downloading Foundry once (~60 MB)...")
+            binary = anvil_install()
+        if not binary:
+            raise SystemExit("anvil is not available: run `demo.py chain install`, or use --chain mock")
+        CHAIN_DIR.mkdir(parents=True, exist_ok=True)
+        port = CHAIN_RPC.rsplit(":", 1)[1]
+        argv = [str(binary), "--host", host, "--port", port, "--chain-id", "31337", "--accounts", "10",
+                "--state", str(ANVIL_STATE), "--state-interval", "1", "--silent"]
+        log_path = CHAIN_DIR / "anvil.log"
+        print(f"Starting the dev chain (anvil) on {CHAIN_RPC} ...")
+        proc = subprocess.Popen(argv, stdout=open(log_path, "ab"), stderr=subprocess.STDOUT)
+        proc.is_chain = True
+        for _ in range(120):
+            if chain_up():
+                break
+            if proc.poll() is not None:
+                raise SystemExit(f"anvil exited (code {proc.returncode}); see {log_path}. Is port {port} in use?")
+            time.sleep(0.25)
+        else:
+            proc.terminate()
+            raise SystemExit("anvil did not answer within 30 s")
+    from dosr_chain import ensure_deployed
+
+    dep = ensure_deployed(CHAIN_RPC)
+    if dep["deployed"]:
+        print(f"Deployed DOSRRegistry at {dep['contract']} (block {dep['block']})")
+    else:
+        print(f"DOSRRegistry at {dep['contract']}")
+    os.environ["DOSR_CONTRACT"] = dep["contract"]
+    return proc
+
+
+def stop_procs(procs) -> None:
+    if any(getattr(p, "is_chain", False) and p.poll() is None for p in procs):
+        time.sleep(1.5)
+    for proc in reversed(procs):
+        if proc.poll() is None:
+            proc.terminate()
+
+
+def chain_env() -> dict:
+    if CHAIN_KIND == "mock":
+        return {"DOSR_CHAIN": "mock"}
+    from dosr_chain.dev import DEV_CONTRACT_ADDRESS
+
+    return {"DOSR_CHAIN": "evm", "DOSR_RPC_URL": CHAIN_RPC,
+            "DOSR_CONTRACT": os.environ.get("DOSR_CONTRACT") or DEV_CONTRACT_ADDRESS}
+
+
+def cmd_chain(args):
+    if args.action == "install":
+        anvil_install(force=args.force)
+        return 0
+    if args.action == "status":
+        from dosr_chain import connect
+
+        print(f"anvil  : {anvil_binary() or 'not installed (demo.py chain install)'}")
+        print(f"RPC    : {CHAIN_RPC} ({'up' if chain_up() else 'not running'})")
+        print(f"state  : {ANVIL_STATE}")
+        if chain_up():
+            info = connect("evm", rpc_url=CHAIN_RPC, contract=chain_env()["DOSR_CONTRACT"]).describe()
+            for k in ("chain_id", "block", "contract", "deployed", "code_matches_source", "repositories"):
+                print(f"{k:<7}: {info.get(k)}")
+        return 0
+    if args.action == "reset":
+        if chain_up():
+            print("Stop the running dev chain first (close the window running it).")
+            return 1
+        if ANVIL_STATE.exists():
+            ANVIL_STATE.unlink()
+            print(f"Deleted {ANVIL_STATE}")
+        return 0
+    proc = start_chain_process(host=args.host)
+    if not proc:
+        return 0
+    print("Dev chain running; Ctrl+C to stop.")
+    try:
+        return proc.wait()
+    except KeyboardInterrupt:
+        proc.terminate()
+        return 0
+
+
+def cmd_attestor(args):
+    procs = []
+    ensure_chain(procs)
+    print(f"Starting DOSR attestor on {attestor_url(args.port)} (docs: {attestor_url(args.port)}/docs)")
+    try:
+        return subprocess.call(
+            [sys.executable, "-m", "uvicorn", "attestor.main:app", "--port", str(args.port)], cwd=ATTESTOR_DIR,
+            env=attestor_env(),
+        )
+    finally:
+        stop_procs(procs)
+
+
+def _gui_argv(args):
+    argv = [*chain_argv(), "--attestor-url", attestor_url(args.attestor_port),
+            "--ipfs-api", DEVICE.ipfs_api, "--local-store", str(LOCAL_STORE), "gui",
+            "--workspace", str(WORKSPACE), "--seeds", str(PROJECTS), "--profiles", str(CLIENTS),
+            "--port", str(args.port), "--env-file", str(ROOT / ".env"), "--device", args.device_name]
+    if args.p2p_port:
+        argv += ["--p2p-port", str(args.p2p_port)]
+        if args.p2p_host:
+            argv += ["--p2p-host", args.p2p_host]
+    if args.no_browser:
+        argv.append("--no-browser")
+    return argv
+
+
+def cmd_gui(args):
+    from dosr_client.cli import main as dosr
+
+    WORKSPACE.mkdir(parents=True, exist_ok=True)
+    procs = []
+    ensure_chain(procs)
+    if not attestor_up(args.attestor_port):
+        print(f"note: no attestor at {attestor_url(args.attestor_port)} yet; start it with `demo.py attestor`")
+    try:
+        return dosr(_gui_argv(args))
+    finally:
+        stop_procs(procs)
+
+
+def cmd_up(args):
+    from dosr_client.cli import main as dosr
+
+    procs = []
+    ensure_chain(procs)
+    if not args.no_ipfs:
+        ipfs = start_ipfs_process(DEVICE)
+        if ipfs:
+            procs.append(ipfs)
+    if attestor_up(args.attestor_port):
+        print(f"Using already-running attestor at {attestor_url(args.attestor_port)}")
+        if problem := attestor_chain_problem(args.attestor_port):
+            print(f"WARNING: that attestor follows a different chain ({problem}); stop it and run this again.")
+    else:
+        print(f"Starting attestor on {attestor_url(args.attestor_port)}...")
+        procs.append(start_attestor_process(args.attestor_port))
+    WORKSPACE.mkdir(parents=True, exist_ok=True)
+    try:
+        return dosr(_gui_argv(args))
+    finally:
+        stop_procs(procs)
+
+
+def cmd_pair(args):
+    import httpx
+    import webbrowser
+
+    if len(args.devices) != 2 or args.devices[0] == args.devices[1]:
+        raise SystemExit("--devices takes two different letters, e.g. ab")
+    devices = [Device(args.devices[0]), Device(args.devices[1])]
+    procs: list[subprocess.Popen] = []
+
+    def stop_all():
+        stop_procs(procs)
+
+    try:
+        ensure_chain(procs)
+        for dev in devices:
+            dev.workspace.mkdir(parents=True, exist_ok=True)
+            if not args.no_ipfs:
+                node = start_ipfs_process(dev)
+                if node:
+                    procs.append(node)
+            if attestor_up(dev.attestor_port):
+                print(f"Using already-running attestor at {attestor_url(dev.attestor_port)}")
+                if problem := attestor_chain_problem(dev.attestor_port):
+                    print(f"WARNING: that attestor follows a different chain ({problem}); stop it and retry.")
+            else:
+                print(f"Starting attestor for device {dev.name} on {attestor_url(dev.attestor_port)}...")
+                procs.append(start_attestor_process(dev.attestor_port, dev))
+            procs.append(subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--device", dev.name,
+                                           "--chain", CHAIN_KIND, "gui", "--no-browser", "--p2p-host", "127.0.0.1",
+                                           "--name", f"Laptop {dev.name.upper()}"]))
+        guis = [httpx.Client(base_url=f"http://127.0.0.1:{d.gui_port}", timeout=30) for d in devices]
+        for dev, gui in zip(devices, guis):
+            for _ in range(120):
+                try:
+                    if gui.get("/api/p2p").status_code == 200:
+                        break
+                except httpx.HTTPError:
+                    pass
+                if any(p.poll() is not None for p in procs[-2:]):
+                    raise SystemExit(f"device {dev.name}'s GUI exited (is port {dev.gui_port} in use?)")
+                time.sleep(0.25)
+            else:
+                raise SystemExit(f"device {dev.name}'s GUI did not start")
+
+        a, b = guis
+        a.post("/api/profile", json={"id": "alice"})
+        b.post("/api/profile", json={"id": "bob"})
+        peered = b.post("/api/p2p/peers", json={"url": f"http://127.0.0.1:{devices[0].inbox_port}"})
+        if peered.status_code != 200:
+            print(f"warning: could not peer the two clients: {peered.text}")
+        pa = a.get("/api/p2p").json()
+        if pa.get("backend") == "ipfs" and b.get("/api/p2p").json().get("backend") == "ipfs":
+            addr = f"/ip4/127.0.0.1/tcp/{devices[0].ipfs_swarm_port}/p2p/{pa['ipfs']['peer_id']}"
+            res = b.post("/api/p2p/connect", json={"addr": addr}).json().get("results", [{}])[0]
+            print(f"IPFS nodes connected: {'yes' if res.get('ok') else 'no (' + str(res.get('error')) + ')'}")
+        else:
+            print("IPFS is not running: the two clients share through the local store instead.")
+
+        print()
+        print("Two DOSR clients are running on this computer:")
+        for dev in devices:
+            print(f"  Laptop {dev.name.upper()}: http://127.0.0.1:{dev.gui_port}/   workspace {dev.workspace}")
+        print("Create a repo on Laptop A; it shows up in Laptop B's inbox (P2P button, top right)"
+              + (" and on the shared chain (chain button: Clone)" if CHAIN_KIND == "evm" else "")
+              + ". Ctrl+C or close this window to stop both.")
+        if not args.no_browser and not os.environ.get("DOSR_NO_BROWSER"):
+            for dev in devices:
+                webbrowser.open(f"http://127.0.0.1:{dev.gui_port}/")
+        while all(p.poll() is None for p in procs):
+            time.sleep(0.5)
+        print("A process exited; stopping the demo.")
+        return 1
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        stop_all()
+
+
+def reset_chain() -> None:
+    if chain_up():
+        import httpx
+
+        httpx.post(CHAIN_RPC, json={"jsonrpc": "2.0", "id": 1, "method": "anvil_reset", "params": []},
+                   timeout=10).raise_for_status()
+        from dosr_chain import ensure_deployed
+
+        dep = ensure_deployed(CHAIN_RPC)
+        print(f"Reset the dev chain at {CHAIN_RPC}; DOSRRegistry redeployed at {dep['contract']}")
+    elif ANVIL_STATE.exists():
+        ANVIL_STATE.unlink()
+        print(f"Deleted {ANVIL_STATE}")
+
+
+def cmd_reset(args):
+    if WORKSPACE.exists():
+        remove_workspace(DEVICE)
+        print(f"Deleted {WORKSPACE}")
+    else:
+        print("No workspace to delete.")
+    if DEVICE.name == "a" and not args.keep_chain and CHAIN_KIND == "evm":
+        reset_chain()
+        for other in sorted(DEMO.glob("workspace-?")):
+            remove_workspace(Device(other.name[-1]))
+            print(f"Deleted {other} (its repositories were on the chain that was just reset)")
+    return 0
+
+
+LLM_DEFAULTS = [
+    ("ANTHROPIC_API_KEY", "anthropic/claude-sonnet-4-5@20250929"),
+    ("OPENAI_API_KEY", "openai/gpt-4.1@2025-04-14"),
+    ("GEMINI_API_KEY", "gemini/gemini-2.5-flash@stable"),
+    ("GOOGLE_API_KEY", "gemini/gemini-2.5-flash@stable"),
+    ("ZHIPU_API_KEY", "zhipu/glm-4-plus@api-v4"),
+]
+LLM_KEYS = [k for k, _ in LLM_DEFAULTS]
+
+
+def pick_llm_model() -> str | None:
+    if os.environ.get("DEMO_LLM_MODEL"):
+        return os.environ["DEMO_LLM_MODEL"]
+    return next((model for env, model in LLM_DEFAULTS if os.environ.get(env)), None)
+
+
+def cmd_run(args):
+    import json
+
+    from rich.console import Console
+    from rich.rule import Rule
+    from rich.table import Table
+
+    from dosr_client.cli import main as dosr
+    from dosr_git import GitRepo
+
+    console = Console(highlight=False)
+    procs: list[subprocess.Popen] = []
+    ensure_chain(procs)
+    if args.reset:
+        args.keep_chain = False
+        cmd_reset(args)
+    WORKSPACE.mkdir(parents=True, exist_ok=True)
+
+    proc = None
+    if not attestor_up(args.attestor_port):
+        if not args.start_attestor:
+            console.print(f"[red]No attestor at {attestor_url(args.attestor_port)}.[/] Start one with "
+                          "`demo.py attestor`, or pass --start-attestor.")
+            return 1
+        console.print(f"Starting attestor on {attestor_url(args.attestor_port)}...")
+        proc = start_attestor_process(args.attestor_port)
+    elif problem := attestor_chain_problem(args.attestor_port):
+        console.print(f"[red]The attestor at {attestor_url(args.attestor_port)} follows a different chain:[/] {problem}. "
+                      "Stop it and re-run with --start-attestor.")
+        return 1
+
+    for name in ("calculator-py", "todo-js", "secure-vault"):
+        if (WORKSPACE / name).exists():
+            console.print(f"[red]{WORKSPACE / name} already exists.[/] Re-run with --reset to start fresh.")
+            return 1
+
+    store = ["--ipfs-api", IPFS_API, "--local-store", str(LOCAL_STORE)]
+    base = [*chain_argv(), "--attestor-url", attestor_url(args.attestor_port), *store]
+    results = []
+    llm = pick_llm_model()
+
+    def as_client(client, *argv, repo=None):
+        full = [*base, "--profile", str(CLIENTS / f"{client}.json")]
+        if repo:
+            full += ["-C", str(WORKSPACE / repo)]
+        return dosr([*full, *argv])
+
+    def apply_change(seed, change_id, repo):
+        src = PROJECTS / seed / "changes" / change_id
+        shutil.copytree(src, WORKSPACE / repo, dirs_exist_ok=True)
+
+    def latest(repo):
+        runs = sorted((WORKSPACE / repo / ".git" / "dosr" / "submissions").glob("*/run.json"),
+                      key=lambda p: p.stat().st_mtime)
+        return json.loads(runs[-1].read_text("utf-8")) if runs else None
+
+    def scenario(title, who, explain):
+        console.print()
+        console.print(Rule(f"[bold]{title}[/]  ·  as [cyan]{who}[/]"))
+        console.print(f"[dim]{explain}[/]")
+        if args.pause:
+            input("  press Enter to continue...")
+
+    def record(title, who, expect, repo):
+        run = latest(repo)
+        results.append((title, who, expect, run["outcome"] if run else "—", run["elapsed_ms"] if run else None))
+
+    def seed_meta(seed):
+        return json.loads((PROJECTS / seed / "seed.json").read_text("utf-8"))
+
+    def init_from_seed(client, seed, preset=None, models=None):
+        meta = seed_meta(seed)
+        over = dict(meta.get("policy_overrides", {}))
+        if models:
+            over["approved_models"] = models
+        description = meta["description"]
+        if preset and preset != meta["preset"]:
+            description = f"{description.split('.')[0]}. Running on the {preset} preset (no LLM key set)."
+        argv = ["init", str(WORKSPACE / seed), "--name", seed, "--description", description,
+                "--preset", preset or meta["preset"], "--seed", str(PROJECTS / seed / "files")]
+        for m in over.get("approved_models", []):
+            argv += ["--model", m]
+        for g in over.get("context_files", []):
+            argv += ["--context-file", g]
+        if over.get("template"):
+            argv += ["--template", over["template"]]
+        as_client(client, *argv)
+
+    def drop_last_commit(repo):
+        GitRepo(WORKSPACE / repo).run("reset", "-q", "--hard", "HEAD~1")
+
+    try:
+        meta = seed_meta("calculator-py")
+        calc_preset = meta["preset"] if llm else "standard"
+        scenario("1. Create repository calculator-py", "Alice",
+                 "git init + seed files + immutable .dosr/policy.json, genesis commit, register on the mock chain "
+                 "(a local file standing in for the contract). The policy adds docs/*.md as required review "
+                 "context. " + (f"Policy llm-review: PRs must be reviewed by {llm}."
+                                if llm else f"No LLM key ({', '.join(LLM_KEYS)}): using the standard (mock "
+                                            "reviewer) policy."))
+        init_from_seed("alice", "calculator-py", calc_preset, models=[llm] if llm else None)
+        results.append(("Create calculator-py", "Alice", "created", "created", None))
+
+        ch = meta["demo_changes"][0]
+        scenario("2. Propose a change (power/modulo)", "Bob",
+                 "`dosr submit -m`: commit → bundle → PR → prompt (template + docs/CONTRIBUTING.md) → validate "
+                 "locally (the attestor's checks, run on the exact bytes) → the attestor rebuilds PR + prompt from "
+                 "the bundle, checks they match ours, " + (f"{llm} reviews it" if llm else "the mock reviewer approves")
+                 + " → signed attestation → verify → register.")
+        apply_change("calculator-py", ch["id"], "calculator-py")
+        as_client("bob", "submit", "-m", ch["message"], "--show-checks", repo="calculator-py")
+        record("Bob: add power()/modulo()", "Bob", "approved", "calculator-py")
+
+        ch = meta["demo_changes"][1]
+        scenario("3. Unapproved model: the client stops it", "Mallory",
+                 "Mallory's profile asks for `mock/always-approve@1`. Local validation fails model_is_approved, "
+                 "so nothing is sent.")
+        apply_change("calculator-py", ch["id"], "calculator-py")
+        as_client("mallory", "submit", "-m", ch["message"], repo="calculator-py")
+        record("Mallory: unapproved model", "Mallory", "blocked", "calculator-py")
+
+        scenario("4. ...forced through with a modified client: the attestor rejects", "Mallory",
+                 "`--force` skips local validation (as a modified client would). The attestor runs the same checks "
+                 "itself and returns a signed REJECTED attestation; canonical HEAD does not move.")
+        as_client("mallory", "submit", "--force", repo="calculator-py")
+        record("Mallory: unapproved model, forced", "Mallory", "rejected", "calculator-py")
+        drop_last_commit("calculator-py")
+
+        git = GitRepo(WORKSPACE / "calculator-py")
+        scenario("5. Stale parent (work built on an old HEAD)", "Bob",
+                 "Bob branches from the genesis commit, which is no longer canonical. The client refuses before "
+                 "building anything; the contract would reject it anyway.")
+        root = git.run("rev-list", "--max-parents=0", "HEAD").split()[0]
+        git.run("checkout", "-q", "-b", "stale-work", root)
+        (WORKSPACE / "calculator-py" / "NOTES.md").write_text("Some notes written against an old HEAD.\n")
+        as_client("bob", "submit", "-m", "Add notes", repo="calculator-py")
+        record("Bob: stale branch", "Bob", "error", "calculator-py")
+        git.run("checkout", "-q", "-f", "main")
+        git.run("branch", "-q", "-D", "stale-work")
+
+        tampering = [
+            ("stale-parent", "head mismatch: claims an older parent than the canonical HEAD"),
+            ("bundle-hash-mismatch", "checksum mismatch: bundle bytes differ from the sha256 in the request"),
+            ("wrong-prompt-template", "prompt template mismatch: prompt built with another template"),
+            ("tampered-prompt", "prompt injection: a 'pre-approved' note added to the prompt"),
+            ("modified-policy", "loosened policy: extra always-approve model, hash recomputed to match"),
+        ]
+        scenario("6. Tampered requests: blocked by the client, rejected by the attestor when forced", "Bob",
+                 "Each bad-request mode corrupts one part of an otherwise valid PR. Without --force the client's "
+                 "validation stops it; with --force the attestor rejects it (signed, before any model call).")
+        (WORKSPACE / "calculator-py" / "CHANGELOG.md").write_text("- power() and modulo()\n")
+        as_client("bob", "commit", "-m", "Add changelog", repo="calculator-py")
+        for mode, what in tampering:
+            console.print(Rule(f"[yellow]{mode}[/]: {what}", style="dim"))
+            as_client("bob", "submit", "--bad-request", mode, repo="calculator-py")
+            record(f"Bob: {mode}", "Bob", "blocked", "calculator-py")
+            as_client("bob", "submit", "--bad-request", mode, "--force", repo="calculator-py")
+            record(f"Bob: {mode}, forced", "Bob", "rejected", "calculator-py")
+        drop_last_commit("calculator-py")
+
+        meta = seed_meta("todo-js")
+        ch = meta["demo_changes"][0]
+        scenario("7. New repo todo-js: custom PR template + minimum model version", "Carol",
+                 "The policy approves mock/deterministic-reviewer@^1.2.0 (>=1.2.0 <2.0.0), requires docs/*.md + "
+                 "package.json as context, and uses the custom PR template demo/templates/team-review-v1.toml "
+                 "(embedded in the policy, so its hash is fixed at genesis; the attestor lays out the PR with it). "
+                 "Carol commits twice and submits both commits as one PR, first asking for an outdated 1.1.0, "
+                 "then for 1.4.2.")
+        init_from_seed("carol", "todo-js")
+        apply_change("todo-js", ch["id"], "todo-js")
+        as_client("carol", "commit", "-m", "Add complete() and open()", repo="todo-js")
+        with open(WORKSPACE / "todo-js" / "README.md", "a", encoding="utf-8") as f:
+            f.write("\nCompleted items can be filtered out with `list.open()`.\n")
+        as_client("carol", "submit", "-m", ch["message"], "--model", "mock/deterministic-reviewer@1.1.0",
+                  repo="todo-js")
+        record("Carol: model 1.1.0 (below ^1.2.0)", "Carol", "blocked", "todo-js")
+        as_client("carol", "submit", "--model", "mock/deterministic-reviewer@1.1.0", "--force", repo="todo-js")
+        record("Carol: model 1.1.0, forced", "Carol", "rejected", "todo-js")
+        console.print(Rule("[green]same commits, model 1.4.2 (inside ^1.2.0)[/]", style="dim"))
+        as_client("carol", "submit", "--model", "mock/deterministic-reviewer@1.4.2", repo="todo-js")
+        record("Carol: model 1.4.2, 2 commits", "Carol", "approved", "todo-js")
+
+        meta = seed_meta("secure-vault")
+        ch = meta["demo_changes"][0]
+        scenario("8. Strict policy: this attestor is not trusted by the repo", "Alice",
+                 "secure-vault only trusts attestor-a/attestor-b. The client sees (via /v1/keys) that our attestor "
+                 "is not listed and blocks; forced, the attestor itself refuses to approve.")
+        init_from_seed("alice", "secure-vault")
+        apply_change("secure-vault", ch["id"], "secure-vault")
+        model = ["--model", "provider-a/review-model-a@pinned-version"]
+        as_client("alice", "submit", "-m", ch["message"], *model, repo="secure-vault")
+        record("Alice: secure-vault change", "Alice", "blocked", "secure-vault")
+        as_client("alice", "submit", *model, "--force", repo="secure-vault")
+        record("Alice: secure-vault change, forced", "Alice", "rejected", "secure-vault")
+
+        ch = seed_meta("calculator-py")["demo_changes"][2]
+        if not llm:
+            console.print()
+            console.print(Rule("[bold]9. LLM review scenario skipped"))
+            console.print(f"[yellow]calculator-py ran on the mock reviewer. Set one of {', '.join(LLM_KEYS)} "
+                          "(environment or the repo's .env) to have a real LLM review its PRs.[/]")
+        else:
+            scenario("9. Backdoor caught by the LLM review", "Mallory",
+                     "Mallory adds evaluate(), which runs arbitrary Python through eval() with full builtins, and a "
+                     "comment telling the reviewer the PR is pre-approved. Every deterministic check passes (approved "
+                     "model, correct prompt), so the attestor calls the LLM, which rejects it; the signed rejection "
+                     "lists the issues.")
+            apply_change("calculator-py", ch["id"], "calculator-py")
+            as_client("mallory", "submit", "-m", ch["message"], "--model", llm, repo="calculator-py")
+            record(f"Mallory: eval() backdoor via {llm.split('/')[0]}", "Mallory", ch["expect"], "calculator-py")
+            drop_last_commit("calculator-py")
+
+        if not args.no_p2p:
+            if CHAIN_KIND == "evm":
+                results.extend(shared_chain_scenario(args, console, scenario, dosr, store, as_client))
+            else:
+                results.extend(p2p_scenario(args, console, scenario, dosr, store, as_client))
+
+        console.print()
+        console.print(Rule("[bold]Summary"))
+        as_client("alice", "chain", *(["--activity", "12"] if CHAIN_KIND == "evm" else []))
+        t = Table(title="Scenario outcomes  (blocked = stopped by the client before sending; "
+                        "rejected = signed rejection from the attestor)")
+        for col in ("Scenario", "Client", "Expected", "Actual", "Total time"):
+            t.add_column(col)
+        all_ok = True
+        for title, who, expect, actual, elapsed in results:
+            ok = expect == actual
+            all_ok &= ok
+            t.add_row(title, who, expect, f"[{'green' if ok else 'red'}]{actual}[/]",
+                      "" if elapsed is None else f"{elapsed:.0f} ms")
+        console.print(t)
+        console.print(f"\nOpen the GUI on this workspace with: [bold]{Path(sys.executable).name} demo/demo.py gui[/]")
+        return 0 if all_ok else 1
+    finally:
+        if proc:
+            proc.terminate()
+        stop_procs(procs)
+
+
+def _latest_run(repo_path: Path) -> dict | None:
+    import json
+
+    runs = sorted((repo_path / ".git" / "dosr" / "submissions").glob("*/run.json"), key=lambda p: p.stat().st_mtime)
+    return json.loads(runs[-1].read_text("utf-8")) if runs else None
+
+
+def shared_chain_scenario(args, console, scenario, dosr, store, as_client):
+    import json
+
+    from rich.rule import Rule
+
+    from dosr_chain import StaleParentError, connect
+    from dosr_client.chain_sync import record_conflict, record_landed
+    from dosr_client.config import DosrRepo, load_profile
+
+    dev_b = Device("b")
+    out = []
+    if dev_b.workspace.exists():
+        remove_workspace(dev_b)
+    dev_b.workspace.mkdir(parents=True, exist_ok=True)
+    repo_a, repo_b = WORKSPACE / "calculator-py", dev_b.workspace / "calculator-py"
+    b_base = [*chain_argv(), "--attestor-url", attestor_url(dev_b.attestor_port), *store]
+
+    def as_b(client, *argv, repo=True):
+        full = [*b_base, "--profile", str(CLIENTS / f"{client}.json")]
+        if repo:
+            full += ["-C", str(repo_b)]
+        return dosr([*full, *argv])
+
+    scenario("10. A second device clones from the chain", "Carol on device B",
+             "Alice publishes calculator-py: a git bundle of the canonical HEAD goes to "
+             + ("IPFS" if ipfs_up() else "the local store (no IPFS node running)")
+             + " and its share code is recorded on the chain (publishSnapshot). Device B has its own workspace "
+             f"and attestor (:{dev_b.attestor_port}) but the same chain. `dosr clone calculator-py` finds the repo "
+             "and its snapshot on the chain, fetches the bundle, and checks it against the genesis, policy hash "
+             "and signed history the chain holds. No share code is passed between the devices.")
+    proc_b = None
+    if not attestor_up(dev_b.attestor_port):
+        proc_b = start_attestor_process(dev_b.attestor_port, dev_b)
+    try:
+        as_client("alice", "publish", repo="calculator-py")
+        console.print(Rule("[cyan]device B[/]: dosr clone calculator-py", style="dim"))
+        rc = as_b("carol", "clone", "calculator-py", "--workspace", str(dev_b.workspace), repo=False)
+        out.append(("Device B: clone from the chain", "Carol", "cloned", "cloned" if rc == 0 else "error", None))
+        if rc:
+            return out
+
+        scenario("11. Two approved PRs race for the same parent", "Bob (device A) vs Carol (device B)",
+                 "Both start from the same canonical HEAD and each gets an APPROVED attestation from their own "
+                 "attestor (submitted with --no-register, so nothing lands yet). Both attestations are valid, but "
+                 "the contract only accepts a transition whose parent is the current HEAD. We send both "
+                 "transactions into the SAME block: the chain orders them, the first moves HEAD, and the second "
+                 "reverts with StaleParent. Every node that reads the chain sees the same single winner.")
+        with open(repo_a / "README.md", "a", encoding="utf-8") as f:
+            f.write("\n## Usage\n\n```python\nfrom calculator import power\nprint(power(2, 10))  # 1024\n```\n")
+        as_client("bob", "submit", "-m", "Document usage in the README", "--no-register", repo="calculator-py")
+        run_bob = _latest_run(repo_a)
+        out.append(("Bob: PR on HEAD, not landed yet", "Bob", "approved", run_bob["outcome"], run_bob["elapsed_ms"]))
+        (repo_b / "CHANGELOG.md").write_text("# Changelog\n\n- power() and modulo()\n- Usage docs\n", encoding="utf-8")
+        as_b("carol", "submit", "-m", "Add a changelog", "--no-register")
+        run_carol = _latest_run(repo_b)
+        out.append(("Carol: PR on the same HEAD, not landed", "Carol", "approved", run_carol["outcome"],
+                    run_carol["elapsed_ms"]))
+        if run_bob["outcome"] != "approved" or run_carol["outcome"] != "approved":
+            return out
+
+        e = chain_env()
+        racers = [("Bob", repo_a, run_bob, "bob"), ("Carol", repo_b, run_carol, "carol")]
+        chains = {name: connect("evm", rpc_url=e["DOSR_RPC_URL"], contract=e["DOSR_CONTRACT"],
+                                private_key=load_profile(CLIENTS / f"{pid}.json").chain_key())
+                  for name, _, _, pid in racers}
+        responses = {name: json.loads((Path(run["artifacts_dir"]) / "response.json").read_text("utf-8"))
+                     for name, _, run, _ in racers}
+        miner = chains["Bob"]
+        console.print(Rule("[magenta]chain[/]: automine off → send both acceptTransition txs → mine one block",
+                           style="dim"))
+        miner.set_automine(False)
+        try:
+            txs = {name: chains[name].send_transition(responses[name]) for name, _, _, _ in racers}
+            for name, tx in txs.items():
+                console.print(f"  sent {name}'s transition: tx {tx}")
+            miner.mine()
+        finally:
+            miner.set_automine(True)
+        winner = loser = None
+        for name, repo_path, run, _ in racers:
+            try:
+                ev = chains[name].transition_result(txs[name], responses[name])
+                record_landed(DosrRepo(repo_path), run["request_id"], ev)
+                winner = (name, repo_path, run)
+                console.print(f"  [green]✓ {name}[/] landed in block {ev['block']}: canonical HEAD → "
+                              f"{ev['candidate_git_oid'][:17]}… ({ev['gas_used']:,} gas)")
+            except StaleParentError as err:
+                record_conflict(DosrRepo(repo_path), run["request_id"], err)
+                loser = (name, repo_path, run)
+                console.print(f"  [bold red]✗ {name}[/] reverted in the same block: {err}")
+        out.append(("Race: both in one block", "Bob vs Carol", "1 landed, 1 StaleParent",
+                    "1 landed, 1 StaleParent" if winner and loser else "unexpected", None))
+        if not (winner and loser):
+            return out
+
+        w_name, w_repo, _ = winner
+        l_name, l_repo, _ = loser
+        on_a = w_repo == repo_a
+
+        def run_on(repo_path, client, *argv):
+            if repo_path == repo_a:
+                return as_client(client, *argv, repo="calculator-py")
+            return as_b(client, *argv)
+
+        w_client, l_client = ("bob", "carol") if on_a else ("carol", "bob")
+        scenario(f"12. {l_name} lost: sync, rebase, resubmit", l_name,
+                 f"{w_name} publishes the new HEAD (snapshot on the chain). {l_name}'s client reads the chain: the "
+                 "canonical HEAD is a commit it does not have, so `dosr sync` fetches the snapshot the chain points "
+                 f"at, verifies it, and rebases {l_name}'s commit onto it. The old approval named the old parent, so "
+                 "it can never land; the rebased commit is reviewed again and lands on top.")
+        run_on(w_repo, w_client, "publish")
+        run_on(l_repo, l_client, "verify")
+        rc = run_on(l_repo, l_client, "sync")
+        out.append((f"{l_name}: sync + rebase onto {w_name}'s HEAD", l_name, "synced",
+                    "synced" if rc == 0 else "error", None))
+        run_on(l_repo, l_client, "submit")
+        run = _latest_run(l_repo)
+        out.append((f"{l_name}: resubmit rebased PR", l_name, "approved", run["outcome"], run["elapsed_ms"]))
+
+        scenario("13. Both devices hold the one canonical state", "Bob and Carol",
+                 f"{w_name}'s device syncs (fast-forward to {l_name}'s commit from the snapshot on the chain); then "
+                 "each device verifies its clone against the chain alone.")
+        run_on(w_repo, w_client, "sync")
+        rc_a = as_client("bob", "verify", repo="calculator-py")
+        rc_b = as_b("carol", "verify")
+        heads = [_git_head(repo_a), _git_head(repo_b)]
+        same = heads[0] == heads[1] and rc_a == 0 and rc_b == 0
+        out.append(("Devices A and B: same verified HEAD", "Bob, Carol", "agree",
+                    "agree" if same else f"differ ({heads[0][:10]} vs {heads[1][:10]})", None))
+    finally:
+        if proc_b:
+            proc_b.terminate()
+    return out
+
+
+def _git_head(path: Path) -> str:
+    from dosr_git import GitRepo
+
+    return GitRepo(path).head() or ""
+
+
+def p2p_scenario(args, console, scenario, dosr, store, as_client):
+    import json
+
+    from rich.rule import Rule
+
+    dev_b = Device("b")
+    out = []
+    if dev_b.workspace.exists():
+        remove_workspace(dev_b)
+    dev_b.workspace.mkdir(parents=True, exist_ok=True)
+    over_ipfs = ipfs_up()
+    scenario("10. Share over IPFS with a second device", "Alice → Bob on device B",
+             ("IPFS node is running: share codes are real CIDs." if over_ipfs else
+              "No IPFS node (run `demo.py ipfs install` + `demo.py up`): using the local store, which works the "
+              "same on one computer.") + " Device B has its own workspace, mock chain and attestor "
+             f"(:{dev_b.attestor_port}). Alice publishes; Bob imports the share code (B's client checks the bundle "
+             "and replays every signed transition on B's chain), lands a change reviewed by B's attestor, and "
+             "Alice pulls it back.")
+    proc_b = None
+    if not attestor_up(dev_b.attestor_port):
+        proc_b = start_attestor_process(dev_b.attestor_port, dev_b)
+    try:
+        as_client("alice", "publish", repo="calculator-py")
+        share = json.loads((WORKSPACE / "calculator-py" / ".git" / "dosr" / "p2p.json").read_text("utf-8"))[
+            "published"][-1]["share"]
+        console.print(Rule(f"[cyan]device B[/]: dosr import {share}", style="dim"))
+        b_base = ["--chain-state", str(dev_b.chain_state), "--attestor-url", attestor_url(dev_b.attestor_port), *store]
+        rc = dosr([*b_base, "--profile", str(CLIENTS / "bob.json"), "import", share,
+                   "--workspace", str(dev_b.workspace)])
+        out.append(("Device B: import calculator-py", "Bob", "imported", "imported" if rc == 0 else "error", None))
+
+        with open(dev_b.workspace / "calculator-py" / "CHANGELOG.md", "a", encoding="utf-8") as f:
+            f.write("- Shared over P2P and improved on device B\n")
+        console.print(Rule("[cyan]device B[/]: dosr submit (reviewed by device B's attestor)", style="dim"))
+        rc = dosr([*b_base, "--profile", str(CLIENTS / "bob.json"), "-C", str(dev_b.workspace / "calculator-py"),
+                   "submit", "-m", "Changelog entry from device B"])
+        out.append(("Device B: PR on the shared repo", "Bob", "approved", "approved" if rc == 0 else f"exit {rc}", None))
+        share_b = json.loads((dev_b.workspace / "calculator-py" / ".git" / "dosr" / "p2p.json").read_text("utf-8"))[
+            "published"][-1]["share"]
+
+        console.print(Rule(f"[cyan]device A[/]: dosr pull {share_b}", style="dim"))
+        rc = as_client("alice", "pull", share_b, repo="calculator-py")
+        out.append(("Device A: pull Bob's change", "Alice", "pulled", "pulled" if rc == 0 else "error", None))
+    finally:
+        if proc_b:
+            proc_b.terminate()
+    return out
+
+
+def remove_workspace(device: Device) -> None:
+    def retry_writable(func, path, _):
+        os.chmod(path, 0o700)
+        func(path)
+    key = "onexc" if sys.version_info >= (3, 12) else "onerror"
+    shutil.rmtree(device.workspace, **{key: retry_writable})
+
+
+def main():
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, ValueError):
+        pass
+    load_dotenv()
+    os.environ["DOSR_TEMPLATES"] = os.pathsep.join(
+        p for p in (os.environ.get("DOSR_TEMPLATES"), str(TEMPLATES)) if p)
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--device", default="a",
+                    help="which simulated device: a (default) or b, c, ... (own workspace, chain, ports)")
+    ap.add_argument("--attestor-port", type=int, help="default: 8080 for device a, 8081 for b, ...")
+    ap.add_argument("--chain", choices=["evm", "mock"], default=os.environ.get("DOSR_CHAIN", "evm"),
+                    help="evm (default): one local anvil chain running the DOSRRegistry contract, shared by every "
+                         "device; mock: a JSON file per device (no anvil)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("attestor", help="run the attestor in the foreground")
+    s.add_argument("--port", type=int)
+    s.set_defaults(func=cmd_attestor)
+
+    for name, fn, helptext in (("gui", cmd_gui, "run the client GUI"),
+                               ("up", cmd_up, "IPFS + attestor + GUI together")):
+        s = sub.add_parser(name, help=helptext)
+        s.add_argument("--port", type=int, help="GUI port (default: 8765 for device a, 8766 for b, ...)")
+        s.add_argument("--p2p-port", type=int, help="peer inbox port, reachable from the LAN "
+                                                    "(default: 8790 for device a, 8791 for b, ...; 0 = off)")
+        s.add_argument("--name", dest="device_name", help="device name other devices see (default: hostname, "
+                                                          "or device-b etc. for simulated devices)")
+        s.add_argument("--p2p-host", help="interface for the peer inbox (default: all, so other computers "
+                                          "can reach it; 127.0.0.1 = this computer only)")
+        s.add_argument("--no-browser", action="store_true")
+        if name == "up":
+            s.add_argument("--no-ipfs", action="store_true", help="do not start an IPFS node")
+        s.set_defaults(func=fn)
+
+    s = sub.add_parser("run", help="scripted end-to-end CLI demo")
+    s.add_argument("--start-attestor", action="store_true", help="start an attestor if none is running")
+    s.add_argument("--reset", action="store_true", help="wipe demo/workspace first")
+    s.add_argument("--pause", action="store_true", help="wait for Enter between scenarios (for presenting)")
+    s.add_argument("--no-p2p", action="store_true", help="skip scenario 10 (sharing with a second device)")
+    s.set_defaults(func=cmd_run)
+
+    s = sub.add_parser("pair", help="two clients on this computer (devices a + b), peered, one tab each")
+    s.add_argument("--no-ipfs", action="store_true", help="share through the local store instead of IPFS")
+    s.add_argument("--no-browser", action="store_true")
+    s.add_argument("--devices", default="ab", help="which two simulated devices to run (default: ab)")
+    s.set_defaults(func=cmd_pair)
+
+    s = sub.add_parser("ipfs", help="IPFS node: install | start (default) | status")
+    s.add_argument("action", nargs="?", choices=["start", "install", "status"], default="start")
+    s.add_argument("--force", action="store_true", help="install: re-download even if present")
+    s.set_defaults(func=cmd_ipfs)
+
+    s = sub.add_parser("chain", help="EVM dev chain (anvil + DOSRRegistry): start (default) | install | status | reset")
+    s.add_argument("action", nargs="?", choices=["start", "install", "status", "reset"], default="start")
+    s.add_argument("--force", action="store_true", help="install: re-download even if present")
+    s.add_argument("--host", default="127.0.0.1",
+                   help="start: interface to listen on; 0.0.0.0 lets other computers use this chain")
+    s.set_defaults(func=cmd_chain)
+
+    s = sub.add_parser("reset", help="delete this device's workspace (device a: and reset the shared chain)")
+    s.add_argument("--keep-chain", action="store_true", help="keep the EVM chain's state")
+    s.set_defaults(func=cmd_reset)
+
+    args = ap.parse_args()
+    global DEVICE, WORKSPACE, CHAIN_STATE, CHAIN_KIND
+    CHAIN_KIND = args.chain
+    os.environ.setdefault("DOSR_PROFILES_DIR", str(CLIENTS))
+    DEVICE = Device(args.device)
+    WORKSPACE, CHAIN_STATE = DEVICE.workspace, DEVICE.chain_state
+    if args.attestor_port is None:
+        args.attestor_port = DEVICE.attestor_port
+    if getattr(args, "port", "absent") is None:
+        args.port = DEVICE.attestor_port if args.cmd == "attestor" else DEVICE.gui_port
+    if getattr(args, "p2p_port", "absent") is None:
+        args.p2p_port = DEVICE.inbox_port
+    if hasattr(args, "device_name") and not args.device_name:
+        import socket
+        args.device_name = socket.gethostname() if DEVICE.name == "a" else f"{socket.gethostname()}-{DEVICE.name}"
+    if args.cmd == "attestor":
+        args.attestor_port = args.port
+    if args.cmd not in ("ipfs",) and not (args.cmd == "chain" and args.action == "install"):
+        _require_deps()
+    sys.exit(args.func(args) or 0)
+
+
+if __name__ == "__main__":
+    main()

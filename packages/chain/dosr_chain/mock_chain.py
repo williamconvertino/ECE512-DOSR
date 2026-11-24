@@ -1,0 +1,157 @@
+import json
+import os
+import tempfile
+import time
+from pathlib import Path
+
+from dosr_protocol.canonical import canonical_json, policy_hash, sha256_0x
+from dosr_protocol.eip712 import attestation_digest, recover_signer
+
+from .errors import ChainError, StaleParentError
+
+
+def default_state_path() -> Path:
+    env = os.environ.get("DOSR_CHAIN_STATE")
+    if env:
+        return Path(env)
+    return Path.home() / ".dosr" / "mock-chain" / "state.json"
+
+
+class MockChain:
+    kind = "mock"
+    shared = False
+    chain_id = 31337
+    contract = "0x4444444444444444444444444444444444444444"
+
+    def __init__(self, state_path=None):
+        self.state_path = Path(state_path) if state_path else default_state_path()
+
+    def as_account(self, private_key=None) -> "MockChain":
+        return self
+
+    def label_accounts(self, labels: dict) -> None:
+        pass
+
+    @property
+    def location(self) -> str:
+        return str(self.state_path)
+
+    def describe(self) -> dict:
+        state = self._load()
+        return {"kind": self.kind, "shared": False, "up": True, "state_path": str(self.state_path),
+                "chain_id": self.chain_id, "contract": self.contract, "block": state["block"],
+                "repositories": len(state["repos"])}
+
+
+    def _load(self) -> dict:
+        if not self.state_path.exists():
+            return {"chain_id": self.chain_id, "contract": self.contract, "block": 0, "repos": {}}
+        return json.loads(self.state_path.read_text("utf-8"))
+
+    def _save(self, state: dict) -> None:
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=self.state_path.parent, suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2)
+        os.replace(tmp, self.state_path)
+
+
+    def get_repository(self, repo_id: str) -> dict | None:
+        return self._load()["repos"].get(repo_id)
+
+    def get_head(self, repo_id: str) -> str:
+        repo = self.get_repository(repo_id)
+        if not repo:
+            raise ChainError(f"repository {repo_id[:18]}… is not registered on the chain")
+        return repo["canonical_head"]
+
+    def list_repositories(self) -> dict:
+        return self._load()["repos"]
+
+
+    def register_repository(self, *, repo_id: str, name: str, policy: dict, genesis_git_oid: str,
+                            object_format: str) -> dict:
+        state = self._load()
+        if repo_id in state["repos"]:
+            raise ChainError(f"repository {repo_id[:18]}… is already registered")
+        state["block"] += 1
+        state["repos"][repo_id] = {
+            "repo_id": repo_id,
+            "name": name,
+            "policy_hash": policy_hash(policy),
+            "attestors": policy["attestors"],
+            "git_object_format": object_format,
+            "genesis_git_oid": genesis_git_oid,
+            "canonical_head": genesis_git_oid,
+            "accepted_transition_count": 0,
+            "registered_block": state["block"],
+            "registered_at": int(time.time()),
+            "events": [],
+        }
+        self._save(state)
+        return state["repos"][repo_id]
+
+    def accept_transition(self, response: dict, now: int | None = None) -> dict:
+        now = int(time.time()) if now is None else now
+        att, sig = response["attestation"], response["signature"]
+        state = self._load()
+        repo = state["repos"].get(att.get("repo_id"))
+
+        def fail(msg):
+            raise ChainError(f"transition rejected by contract: {msg}")
+
+        if repo is None:
+            fail("unknown repository")
+        if att.get("chain_id") != state["chain_id"] or (att.get("verifying_contract") or "").lower() != state["contract"].lower():
+            fail("attestation is for a different chain/contract (domain mismatch)")
+        if att.get("policy_hash") != repo["policy_hash"]:
+            fail("policy hash does not match the genesis policy")
+        signers = {(a["key_id"], a["address"].lower()) for a in repo["attestors"]}
+        if (att.get("attestor_key_id"), (sig.get("signer") or "").lower()) not in signers:
+            fail("attestor is not approved by the repository policy")
+        try:
+            recovered = recover_signer(att, sig.get("value") or "")
+        except Exception:
+            fail("attestation signature is malformed")
+        if recovered.lower() != (sig.get("signer") or "").lower():
+            fail("signature does not match the attestation (recovered a different signer)")
+        if not att.get("approved"):
+            fail("attestation is not an approval")
+        if att.get("expires_at", 0) <= now:
+            fail("attestation has expired")
+        if att.get("parent_git_oid") != repo["canonical_head"]:
+            raise StaleParentError(
+                f"transition rejected by contract: stale parent: attested parent {att.get('parent_git_oid')} "
+                f"!= HEAD {repo['canonical_head']}", head=repo["canonical_head"])
+
+        state["block"] += 1
+        event = {
+            "block": state["block"],
+            "repo_id": repo["repo_id"],
+            "parent_git_oid": att["parent_git_oid"],
+            "candidate_git_oid": att["candidate_git_oid"],
+            "attestor": sig.get("signer"),
+            "attestation_hash": sha256_0x(canonical_json(att)),
+            "attestation_digest": attestation_digest(att),
+            "bundle_cid": att.get("bundle_cid"),
+            "timestamp": now,
+            "seq": repo["accepted_transition_count"] + 1,
+            "chain": "mock",
+        }
+        repo["canonical_head"] = att["candidate_git_oid"]
+        repo["accepted_transition_count"] += 1
+        repo["events"].append(event)
+        self._save(state)
+        return event
+
+    def publish_snapshot(self, repo_id: str, head: str, cid: str) -> dict:
+        state = self._load()
+        repo = state["repos"].get(repo_id)
+        if repo is None:
+            raise ChainError("snapshot rejected: unknown repository")
+        if head != repo["canonical_head"]:
+            raise ChainError(f"snapshot rejected: {head} is not the canonical HEAD {repo['canonical_head']}")
+        state["block"] += 1
+        repo["snapshot"] = {"cid": cid, "head": head}
+        self._save(state)
+        return {"block": state["block"], "cid": cid, "head": head, "tx_hash": None}
